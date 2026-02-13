@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from datetime import datetime
 from sqlalchemy import (
@@ -12,7 +13,12 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///helianthus.db")
+# =========================
+# Config
+# =========================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'helianthus.db')}"
 WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql"
 
 Base = declarative_base()
@@ -27,7 +33,7 @@ class Artist(Base):
 
     id = Column(Integer, primary_key=True)
     wikidata_id = Column(String, unique=True, index=True, nullable=False)
-    name = Column(String, nullable=True)
+    name = Column(String)
 
     paintings = relationship("Painting", back_populates="artist")
 
@@ -36,10 +42,10 @@ class Location(Base):
     __tablename__ = "locations"
 
     id = Column(Integer, primary_key=True)
-    wikidata_id = Column(String, unique=True, index=True, nullable=True)
-    name = Column(String, nullable=True)
-    latitude = Column(Float, nullable=True)
-    longitude = Column(Float, nullable=True)
+    wikidata_id = Column(String, unique=True, index=True)
+    name = Column(String)
+    latitude = Column(Float)
+    longitude = Column(Float)
 
     paintings = relationship("Painting", back_populates="location")
 
@@ -49,11 +55,11 @@ class Painting(Base):
 
     id = Column(Integer, primary_key=True)
     wikidata_id = Column(String, unique=True, index=True, nullable=False)
-    title = Column(String, nullable=True)
-    year = Column(Integer, nullable=True)
+    title = Column(String)
+    year = Column(Integer)
 
     artist_id = Column(Integer, ForeignKey("artists.id"), nullable=False)
-    location_id = Column(Integer, ForeignKey("locations.id"), nullable=True)
+    location_id = Column(Integer, ForeignKey("locations.id"))
 
     artist = relationship("Artist", back_populates="paintings")
     location = relationship("Location", back_populates="paintings")
@@ -67,88 +73,102 @@ def qid_from_uri(uri: str) -> str:
     return uri.rsplit("/", 1)[-1]
 
 
-def ensure_session(database_url: str):
+def ensure_session():
     engine = create_engine(
-        database_url,
+        DATABASE_URL,
         connect_args={"check_same_thread": False}
-        if database_url.startswith("sqlite")
-        else {}
     )
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     return Session()
 
 
-def validate_artist_is_painter(artist_qid: str) -> bool:
-    """
-    Ensures the QID belongs to a painter (occupation = painter).
-    """
+def wikidata_query(query: str, timeout=30):
+    headers = {
+        "Accept": "application/sparql-results+json",
+        "User-Agent": "HelianthusIngest/1.0"
+    }
+
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                WIKIDATA_ENDPOINT,
+                params={"query": query},
+                headers=headers,
+                timeout=timeout
+            )
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.ReadTimeout:
+            print(f"Timeout attempt {attempt+1}, retrying...")
+            time.sleep(3)
+
+    raise Exception("Wikidata query failed after retries")
+
+
+# =========================
+# Artist Metadata
+# =========================
+
+def fetch_artist_label(artist_qid: str) -> str:
     query = f"""
-    ASK {{
-      wd:{artist_qid} wdt:P106 wd:Q1028181.
+    SELECT ?artistLabel WHERE {{
+      wd:{artist_qid} rdfs:label ?artistLabel.
+      FILTER (lang(?artistLabel) = "en")
     }}
     """
 
-    headers = {
-        "Accept": "application/sparql-results+json",
-        "User-Agent": "HelianthusIngest/1.0 (https://github.com)"
-    }
+    data = wikidata_query(query)
+    bindings = data.get("results", {}).get("bindings", [])
 
-    r = requests.get(
-        WIKIDATA_ENDPOINT,
-        params={"query": query},
-        headers=headers,
-        timeout=30
-    )
-    r.raise_for_status()
-    return r.json().get("boolean", False)
+    if not bindings:
+        return None
+
+    return bindings[0]["artistLabel"]["value"]
 
 
 # =========================
-# Ingest Logic
+# Phase 1 – Paintings
 # =========================
 
-def run_ingest(artist_qid: str, limit: int = 200):
-
-    if not validate_artist_is_painter(artist_qid):
-        raise ValueError(...)
-
-    session = ensure_session(DATABASE_URL)
+def ingest_paintings(session, artist_qid: str, limit: int):
+    print("Phase 1: Ingesting paintings...")
 
     sparql = f"""
-    SELECT ?painting ?paintingLabel WHERE {{
+    SELECT ?painting ?paintingLabel ?date WHERE {{
       ?painting wdt:P31 wd:Q3305213.
       ?painting wdt:P170 wd:{artist_qid}.
+      OPTIONAL {{ ?painting wdt:P571 ?date. }}
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
     }}
     LIMIT {limit}
     """
 
-    headers = {
-        "Accept": "application/sparql-results+json",
-        "User-Agent": "HelianthusIngest/1.0 (https://github.com)"
-    }
+    data = wikidata_query(sparql, timeout=60)
+    bindings = data.get("results", {}).get("bindings", [])
 
-    r = requests.get(
-        WIKIDATA_ENDPOINT,
-        params={"query": sparql},
-        headers=headers,
-        timeout=60
-    )
+    # --- Artist ---
+    artist = session.query(Artist).filter_by(
+        wikidata_id=artist_qid
+    ).first()
 
-    r.raise_for_status()
+    if not artist:
+        artist_name = fetch_artist_label(artist_qid)
 
-    bindings = r.json().get("results", {}).get("bindings", [])
+        artist = Artist(
+            wikidata_id=artist_qid,
+            name=artist_name
+        )
+
+        session.add(artist)
+        session.flush()
 
     inserted = 0
 
+    # --- Paintings ---
     for row in bindings:
         p_uri = row.get("painting", {}).get("value")
         p_label = row.get("paintingLabel", {}).get("value")
-        creator_label = row.get("creatorLabel", {}).get("value")
-        location_uri = row.get("location", {}).get("value")
-        location_label = row.get("locationLabel", {}).get("value")
-        coords_val = row.get("coords", {}).get("value")
         date_val = row.get("date", {}).get("value")
 
         if not p_uri:
@@ -156,9 +176,6 @@ def run_ingest(artist_qid: str, limit: int = 200):
 
         p_qid = qid_from_uri(p_uri)
 
-        # -----------------------
-        # Year parsing
-        # -----------------------
         year = None
         if date_val:
             try:
@@ -168,9 +185,63 @@ def run_ingest(artist_qid: str, limit: int = 200):
             except Exception:
                 pass
 
-        # -----------------------
-        # Coordinates parsing
-        # -----------------------
+        painting = session.query(Painting).filter_by(
+            wikidata_id=p_qid
+        ).first()
+
+        if not painting:
+            painting = Painting(
+                wikidata_id=p_qid,
+                title=p_label,
+                year=year,
+                artist=artist
+            )
+            session.add(painting)
+            inserted += 1
+        else:
+            painting.title = p_label or painting.title
+            painting.year = year or painting.year
+
+    session.commit()
+    print(f"Inserted {inserted} paintings.")
+
+# =========================
+# Phase 2 – Locations
+# =========================
+
+def enrich_locations(session):
+    print("Phase 2: Enriching locations...")
+
+    paintings = session.query(Painting).filter(
+        Painting.location_id == None
+    ).all()
+
+    for painting in paintings:
+        query = f"""
+        SELECT ?location ?locationLabel ?coords WHERE {{
+          wd:{painting.wikidata_id} wdt:P276|wdt:P195 ?location.
+          OPTIONAL {{ ?location wdt:P625 ?coords. }}
+          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+        }}
+        """
+
+        data = wikidata_query(query)
+        bindings = data.get("results", {}).get("bindings", [])
+
+        if not bindings:
+            continue
+
+        row = bindings[0]
+
+        loc_uri = row.get("location", {}).get("value")
+        loc_label = row.get("locationLabel", {}).get("value")
+        coords_val = row.get("coords", {}).get("value")
+
+        if not loc_uri:
+            continue
+
+        loc_qid = qid_from_uri(loc_uri)
+
         latitude = None
         longitude = None
 
@@ -183,78 +254,26 @@ def run_ingest(artist_qid: str, limit: int = 200):
             except Exception:
                 pass
 
-        # -----------------------
-        # Artist
-        # -----------------------
-        artist = session.query(Artist).filter_by(
-            wikidata_id=artist_qid
+        location = session.query(Location).filter_by(
+            wikidata_id=loc_qid
         ).first()
 
-        if not artist:
-            artist = Artist(
-                wikidata_id=artist_qid,
-                name=creator_label
+        if not location:
+            location = Location(
+                wikidata_id=loc_qid,
+                name=loc_label,
+                latitude=latitude,
+                longitude=longitude
             )
-            session.add(artist)
+            session.add(location)
             session.flush()
 
-        # -----------------------
-        # Location
-        # -----------------------
-        location = None
+        painting.location = location
+        session.commit()
 
-        if location_uri:
-            location_qid = qid_from_uri(location_uri)
+        time.sleep(0.2)  # be nice to Wikidata
 
-            location = session.query(Location).filter_by(
-                wikidata_id=location_qid
-            ).first()
-
-            if not location:
-                location = Location(
-                    wikidata_id=location_qid,
-                    name=location_label,
-                    latitude=latitude,
-                    longitude=longitude
-                )
-                session.add(location)
-                session.flush()
-            else:
-                # overwrite missing coordinates
-                if latitude and not location.latitude:
-                    location.latitude = latitude
-                if longitude and not location.longitude:
-                    location.longitude = longitude
-
-        # -----------------------
-        # Painting
-        # -----------------------
-        painting = session.query(Painting).filter_by(
-            wikidata_id=p_qid
-        ).first()
-
-        if not painting:
-            painting = Painting(
-                wikidata_id=p_qid,
-                title=p_label,
-                year=year,
-                artist=artist,
-                location=location
-            )
-            session.add(painting)
-            inserted += 1
-        else:
-            painting.title = p_label or painting.title
-            painting.year = year or painting.year
-            painting.artist = artist
-            painting.location = location
-
-    session.commit()
-
-    print(
-        f"Ingest complete for {artist_qid} — "
-        f"{inserted} new paintings (limit={limit})"
-    )
+    print("Location enrichment complete.")
 
 
 # =========================
@@ -264,20 +283,15 @@ def run_ingest(artist_qid: str, limit: int = 200):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Ingest paintings for a specific artist from Wikidata"
-    )
-    parser.add_argument(
-        "--artist",
-        required=True,
-        help="Wikidata QID for artist (e.g., Q5582)"
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=200
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--artist", required=True)
+    parser.add_argument("--limit", type=int, default=200)
 
     args = parser.parse_args()
 
-    run_ingest(args.artist, args.limit)
+    session = ensure_session()
+
+    ingest_paintings(session, args.artist, args.limit)
+    enrich_locations(session)
+
+    print("Done.")
